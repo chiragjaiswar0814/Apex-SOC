@@ -405,6 +405,4 @@ I want to be direct about what this system does not do:
 
 ---
 
-## License
 
-MIT. Use it, break it, fork it.

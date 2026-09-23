@@ -1,0 +1,189 @@
+name: Apex-SOC CI
+
+on:
+  push:
+    branches: [ main, develop, "feature/**" ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "20"
+
+jobs:
+
+  # ─────────────────────────────────────────────────
+  # Job 1: Python quality gates
+  # ─────────────────────────────────────────────────
+  python-quality:
+    name: "Python — Lint, Security & Tests"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      # ── Flake8 lint ──────────────────────────────
+      - name: Flake8 lint
+        run: |
+          flake8 . \
+            --max-line-length=100 \
+            --exclude=__pycache__,.venv \
+            --count \
+            --statistics
+
+      # ── Bandit security scan ─────────────────────
+      - name: Bandit security scan
+        run: |
+          bandit -r . \
+            --exclude ./tests \
+            -ll \
+            -f json \
+            -o bandit-report.json || true
+          # Print summary; fail on HIGH severity
+          python -c "
+          import json, sys
+          with open('bandit-report.json') as f:
+              data = json.load(f)
+          highs = [r for r in data.get('results', []) if r['issue_severity'] == 'HIGH']
+          if highs:
+              for h in highs:
+                  print(f'HIGH: {h[\"filename\"]}:{h[\"line_number\"]} — {h[\"issue_text\"]}')
+              sys.exit(1)
+          print('No HIGH severity issues found.')
+          "
+
+      - name: Upload Bandit report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bandit-security-report
+          path: backend/bandit-report.json
+
+      # ── Pytest unit tests ─────────────────────────
+      - name: Run pytest
+        run: |
+          pytest tests/ \
+            -v \
+            --tb=short \
+            --junit-xml=pytest-results.xml
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pytest-results
+          path: backend/pytest-results.xml
+
+  # ─────────────────────────────────────────────────
+  # Job 2: Frontend lint & build
+  # ─────────────────────────────────────────────────
+  frontend-build:
+    name: "Frontend — Lint & Vite Build"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: ESLint
+        run: npm run lint
+
+      - name: Vite production build
+        run: npm run build
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+
+  # ─────────────────────────────────────────────────
+  # Job 3: Docker build simulation
+  # ─────────────────────────────────────────────────
+  docker-build:
+    name: "Docker — Simulate Compose Build"
+    runs-on: ubuntu-latest
+    needs: [ python-quality, frontend-build ]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: false
+          tags: apex-soc/backend:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: false
+          tags: apex-soc/frontend:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test — backend health
+        run: |
+          docker run -d --name apex-backend -p 8000:8000 apex-soc/backend:ci
+          sleep 10
+          curl -f http://localhost:8000/api/health || (docker logs apex-backend && exit 1)
+          docker stop apex-backend
+
+  # ─────────────────────────────────────────────────
+  # Job 4: Dependency vulnerability scan
+  # ─────────────────────────────────────────────────
+  dependency-scan:
+    name: "Security — Dependency Audit"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python safety check
+        run: |
+          pip install safety
+          safety check -r backend/requirements.txt --full-report || true
+
+      - name: Node npm audit
+        working-directory: frontend
+        run: npm audit --audit-level=high || true
